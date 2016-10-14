@@ -43,32 +43,39 @@ class ConvReLULayer(object):
         self.b = theano.shared(value=b_values, borrow=True)
         self.params = [self.W, self.b]
 
-    def _step(self, _patch):
-        patch = _patch.dimshuffle('x', 0, 1, 2)
-        conv_result = T.nnet.conv2d(
-            input=patch,
-            filters=self.W,
-            input_shape=self.patch_shape,
-            filter_shape=self.filter_shape,
-            border_mode='valid'
-        ) + self.b.dimshuffle('x', 0, 'x', 'x')
-        return conv_result[0, :, :, :]
+    # def _step(self, _patch):
+    #     patch = _patch.dimshuffle('x', 0, 1, 2)
+    #     conv_result = T.nnet.conv2d(
+    #         input=patch,
+    #         filters=self.W,
+    #         input_shape=self.patch_shape,
+    #         filter_shape=self.filter_shape,
+    #         border_mode='valid'
+    #     ) + self.b.dimshuffle('x', 0, 'x', 'x')
+    #     return conv_result[0, :, :, :]
 
-    def makeLayer(self, input, ReLU):
+    def makeLayer(self, inputL, inputR, ReLU):
         # _patch : num of feature maps x patch width x height
         # conv_result: 1 x number of features x width x height
         # conv_results : num of patches x num of features x width x height
 
-        conv_results, updates = theano.scan(
-            fn=self._step,
-            sequences=[input]
-        )
-
+        # conv_results, updates = theano.scan(
+        #     fn=self._step,
+        #     sequences=[input]
+        # )
+        conv_results = T.nnet.conv2d(
+            input=T.concatenate([inputL, inputR]),
+            filters=self.W,
+            input_shape=(1234 * 2, self.patch_shape[1], self.patch_shape[2],
+                         self.patch_shape[3]),
+            filter_shape=self.filter_shape,
+            border_mode='valid'
+        ) + self.b.dimshuffle('x', 0, 'x', 'x')
         if (ReLU):
             conv_results = T.nnet.relu(
                 conv_results
             )
-        return conv_results
+        return conv_results[0:1234], conv_results[1234:2468]
 
 
 def ortho_weight(ndim):
@@ -224,14 +231,12 @@ class bi_lstm_cnn(object):
             filter_shape=filter_shape
         )
 
-        conv1_l = conv1.makeLayer(input_patches_left, True)
-        conv1_r = conv1.makeLayer(input_patches_right, True)
-        conv2_l = conv2.makeLayer(conv1_l, True)
-        conv2_r = conv2.makeLayer(conv1_r, True)
-        conv3_l = conv3.makeLayer(conv2_l, True)
-        conv3_r = conv3.makeLayer(conv2_r, True)
-        conv4_l = conv4.makeLayer(conv3_l, True)
-        conv4_r = conv4.makeLayer(conv3_r, True)
+        conv1_l, conv1_r = conv1.makeLayer(input_patches_left,
+                                           input_patches_right,
+                                           True)
+        conv2_l, conv2_r = conv2.makeLayer(conv1_l, conv1_r, True)
+        conv3_l, conv3_r = conv3.makeLayer(conv2_l, conv2_r, True)
+        conv4_l, conv4_r = conv4.makeLayer(conv3_l, conv3_r, True)
 
         # conv4.output : num of patches x num features x width x height
         left_trans, updates = theano.scan(
