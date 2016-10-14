@@ -314,13 +314,24 @@ def generateData(ImageL, ImageR, ImgId, RowSamples):
     patch_size = 9
     half_size = patch_size // 2
     width = img0.shape[1]
-    sentence_L = np.empty((width - patch_size + 1, 3, patch_size, patch_size))
-    sentence_R = np.empty((width - patch_size + 1, 3, patch_size, patch_size))
+
+    height = img0.shape[0]
+    pad_num_x = 1242 - width
+    pad_num_y = 376 - height
+    img0 = np.pad(img0, ((0, pad_num_y), (0, pad_num_x), (0, 0)),
+                  mode='constant', constant_values=0)
+    img1 = np.pad(img0, ((0, pad_num_y), (0, pad_num_y), (0, 0)),
+                  mode='constant', constant_values=0)
+    # sentence_L = np.empty((width - patch_size + 1, 3, patch_size,patch_size))
+    # sentence_R = np.empty((width - patch_size + 1, 3, patch_size,patch_size))
+    sentence_L = np.empty((1242 - patch_size + 1, 3, patch_size, patch_size))
+    sentence_R = np.empty((1242 - patch_size + 1, 3, patch_size, patch_size))
+
     L = []
     R = []
     for j in RowSamples:
         patch_id = 0
-        for x in range(half_size, width - half_size):
+        for x in range(half_size, 1242 - half_size):
             sample_l = img0[j - half_size: j + half_size + 1,
                             x - half_size: x + half_size + 1,
                             :]
@@ -331,18 +342,30 @@ def generateData(ImageL, ImageR, ImgId, RowSamples):
                 sentence_L[patch_id, k, :, :] = sample_l[:, :, k]
                 sentence_R[patch_id, k, :, :] = sample_r[:, :, k]
             patch_id = patch_id + 1
-        sentence_L = np.asarray(sentence_L, dtype=theano.config.floatX)
-        sentence_R = np.asarray(sentence_R, dtype=theano.config.floatX)
+        # sentence_L = np.asarray(sentence_L, dtype=theano.config.floatX)
+        # sentence_R = np.asarray(sentence_R, dtype=theano.config.floatX)
         L.append(sentence_L)
         R.append(sentence_R)
+    L = np.asarray(L, dtype=theano.config.floatX)
+    R = np.asarray(R, dtype=theano.config.floatX)
     return L, R
-
 
 if __name__ == '__main__':
     index = T.lscalar('index')
     xl = T.tensor4('xl')
     xr = T.tensor4('xr')
     y = T.ivector('y')
+
+    trainL = theano.shared(np.asarray(np.empty((50, 1242-2*4, 3, 9, 9)),
+                                      dtype=theano.config.floatX))
+
+    trainR = theano.shared(np.asarray(np.empty((50, 1242-2*4, 3, 9, 9)),
+                                      dtype=theano.config.floatX))
+
+    batchL = theano.shared(np.asarray(np.empty((50, 1242-2*4, 3, 9, 9)),
+                                      dtype=theano.config.floatX))
+    batchR = theano.shared(np.asarray(np.empty((50, 1242-2*4, 3, 9, 9)),
+                                      dtype=theano.config.floatX))
     # let's just test
     tensor5 = T.TensorType(theano.config.floatX, (False,)*5)
     ImageL, ImageR, disp, RowSample = pickle.load(open('train_set', 'rb'))
@@ -359,8 +382,12 @@ if __name__ == '__main__':
     cost = cnn_lstm.negativeLogLikelihood(y)
 
     validate_model = theano.function(
-        inputs=[xl, xr, y],
-        outputs=cnn_lstm.bad30(y)
+        inputs=[index, y],
+        outputs=cnn_lstm.bad30(y),
+        givens={
+            xl: batchL[index],
+            xr: batchR[index]
+        }
     )
 
     print('...model built')
@@ -369,10 +396,31 @@ if __name__ == '__main__':
     for i in range(200):
         valSample = RowSample[i][50:100]
         disp_I = disp[i][50:100]
+        print(i)
         L, R = generateData(ImageL, ImageR, i, valSample)
-        for j in range(50):
-            val_loss = val_loss + validate_model(L[j].astype('float32'),
-                                                 R[j].astype('float32'),
-                                                 disp_I[j].astype('int32'))
+        batchL.set_value(L, borrow=True)
+        batchR.set_value(R, borrow=True)
+        print('sent new data to gpu')
+        val_loss_perI = [validate_model(j, disp_I[j])
+                         for j in range(50)]
+        val_loss += sum(val_loss_perI)
 
     print(val_loss / 10000.0)
+
+    learning_rate = 0.003
+
+    params = cnn_lstm.params
+    g_params = T.grad(cost, params)
+    updates = [(parami, parami - learning_rate * gradi)
+               for parami, gradi in zip(params, g_params)]
+
+    train_model = theano.function(
+        inputs=[index, y],
+        outputs=cost,
+        updates=updates,
+        givens={
+            xl: trainL[index],
+            xr: trainR[index]
+        }
+    )
+    
