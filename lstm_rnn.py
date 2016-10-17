@@ -2,6 +2,8 @@ import theano
 import theano.tensor as T
 import numpy as np
 import six.moves.cPickle as pickle
+import sys
+import time
 
 
 class ConvReLULayer(object):
@@ -149,7 +151,7 @@ class lstm_layer(object):
         """
         h_: hidden_dim row vector
         """
-        preact = T.dot(h_, self.W)
+        preact = T.dot(h_, self.U)
         preact += x_
 
         i = T.nnet.sigmoid(self._slice(preact, 0, self.hidden_dim))
@@ -196,7 +198,7 @@ class bi_lstm_cnn(object):
         """
         # make patches from ImageL and ImageR with row id and width
         rng = np.random.RandomState(1234)
-        conv1 = ConvReLULayer(
+        self.conv1 = ConvReLULayer(
             rng=rng,
             patch_shape=input_shape,
             filter_shape=input_filter_shape
@@ -206,7 +208,7 @@ class bi_lstm_cnn(object):
         patch_shape2 = (1,
                         filter_shape[0], patch_size2, patch_size2)
 
-        conv2 = ConvReLULayer(
+        self.conv2 = ConvReLULayer(
             rng=rng,
             patch_shape=patch_shape2,
             filter_shape=filter_shape
@@ -215,7 +217,7 @@ class bi_lstm_cnn(object):
         patch_shape3 = (1,
                         filter_shape[0], patch_size3, patch_size3)
 
-        conv3 = ConvReLULayer(
+        self.conv3 = ConvReLULayer(
             rng=rng,
             patch_shape=patch_shape3,
             filter_shape=filter_shape
@@ -225,18 +227,18 @@ class bi_lstm_cnn(object):
         patch_shape4 = (1,
                         filter_shape[0], patch_size4, patch_size4)
 
-        conv4 = ConvReLULayer(
+        self.conv4 = ConvReLULayer(
             rng=rng,
             patch_shape=patch_shape4,
             filter_shape=filter_shape
         )
 
-        conv1_l, conv1_r = conv1.makeLayer(input_patches_left,
-                                           input_patches_right,
-                                           True)
-        conv2_l, conv2_r = conv2.makeLayer(conv1_l, conv1_r, True)
-        conv3_l, conv3_r = conv3.makeLayer(conv2_l, conv2_r, True)
-        conv4_l, conv4_r = conv4.makeLayer(conv3_l, conv3_r, True)
+        conv1_l, conv1_r = self.conv1.makeLayer(input_patches_left,
+                                                input_patches_right,
+                                                True)
+        conv2_l, conv2_r = self.conv2.makeLayer(conv1_l, conv1_r, True)
+        conv3_l, conv3_r = self.conv3.makeLayer(conv2_l, conv2_r, True)
+        conv4_l, conv4_r = self.conv4.makeLayer(conv3_l, conv3_r, True)
 
         # conv4.output : num of patches x num features x width x height
         left_trans, updates = theano.scan(
@@ -258,30 +260,28 @@ class bi_lstm_cnn(object):
         forward_lstm_input_right = right_trans
         backward_lstm_input_right = right_trans[::-1]
 
-        forward_lstm = lstm_layer(
+        self.forward_lstm = lstm_layer(
             hidden_dim=filter_shape[0]
         )
 
-        backward_lstm = lstm_layer(
+        self.backward_lstm = lstm_layer(
             hidden_dim=filter_shape[0]
         )
 
-        self.params = [conv1.params +
-                       conv2.params +
-                       conv3.params +
-                       conv4.params +
-                       forward_lstm.params +
-                       backward_lstm.params]
+        self.params = self.conv1.params + self.conv2.params + self.conv3.params
+        self.params = self.params + self.conv4.params
+        self.params = self.params + self.forward_lstm.params
+        self.params = self.params + self.backward_lstm.params
 
-        left_1 = forward_lstm.makeLayer(forward_lstm_input_left)
-        left_2 = backward_lstm.makeLayer(backward_lstm_input_left)
+        left_1 = self.forward_lstm.makeLayer(forward_lstm_input_left)
+        left_2 = self.backward_lstm.makeLayer(backward_lstm_input_left)
 
         left_feature = T.concatenate([left_1,
                                       left_2[::-1]],
                                      axis=1)
 
-        right_1 = forward_lstm.makeLayer(forward_lstm_input_right)
-        right_2 = backward_lstm.makeLayer(backward_lstm_input_right)
+        right_1 = self.forward_lstm.makeLayer(forward_lstm_input_right)
+        right_2 = self.backward_lstm.makeLayer(backward_lstm_input_right)
         right_feature = T.concatenate([right_1,
                                        right_2[::-1]],
                                       axis=1)
@@ -292,16 +292,23 @@ class bi_lstm_cnn(object):
     # y is directly disparity
     # have not dealt with problems:
     # the pixels without matches
-    def negativeLogLikelihood(self, y):
+    def negativeLogLikelihood(self, y, m):
         match_idx = T.arange(y.shape[0]) - y
-        return -T.mean(T.log(self.softmax_result)[T.arange(y.shape[0]),
-                                                  match_idx])
+        mask = (match_idx > 0) * m * (y > 0)
+        # in GT:
+        # 0 indicates invalid pixel
+        N = T.sum(mask)
+        nll = T.log(self.softmax_result)[T.arange(y.shape[0]),
+                                         match_idx]
+        return -T.sum(nll * mask) / (N + 1)
 
-    def bad30(self, y):
+    def bad30(self, y, m):
         match_idx = T.arange(y.shape[0]) - y
+        mask = (match_idx > 0) * m * (y > 0)
+        N = T.sum(mask)
         return T.sum(T.ge(abs(match_idx -
                               self.match_pred[0: y.shape[0]]),
-                          3.0)) / y.shape[0]
+                          3.0) * mask) / (N + 1)
 
 
 def makeShare(x):
@@ -360,20 +367,22 @@ if __name__ == '__main__':
     xl = T.tensor4('xl')
     xr = T.tensor4('xr')
     y = T.ivector('y')
-
-    trainL = theano.shared(np.asarray(np.empty((50, 1242-2*4, 3, 9, 9)),
+    m = T.vector('m')
+    trainL = theano.shared(np.asarray(np.empty((200, 1242-2*4, 3, 9, 9)),
                                       dtype=theano.config.floatX))
 
-    trainR = theano.shared(np.asarray(np.empty((50, 1242-2*4, 3, 9, 9)),
+    trainR = theano.shared(np.asarray(np.empty((200, 1242-2*4, 3, 9, 9)),
                                       dtype=theano.config.floatX))
 
-    batchL = theano.shared(np.asarray(np.empty((50, 1242-2*4, 3, 9, 9)),
+    batchL = theano.shared(np.asarray(np.empty((100, 1242-2*4, 3, 9, 9)),
                                       dtype=theano.config.floatX))
-    batchR = theano.shared(np.asarray(np.empty((50, 1242-2*4, 3, 9, 9)),
+    batchR = theano.shared(np.asarray(np.empty((100, 1242-2*4, 3, 9, 9)),
                                       dtype=theano.config.floatX))
     # let's just test
     tensor5 = T.TensorType(theano.config.floatX, (False,)*5)
-    ImageL, ImageR, disp, RowSample = pickle.load(open('train_set', 'rb'))
+    ImageL, ImageR, disp, RowSample, mask = pickle.load(open('kitti2015',
+                                                             'rb'))
+
     print('...building the model')
     cnn_lstm = bi_lstm_cnn(
         input_patches_left=xl,
@@ -384,43 +393,35 @@ if __name__ == '__main__':
         filter_shape=(112, 112, 3, 3)
     )
 
-    cost = cnn_lstm.negativeLogLikelihood(y)
+    cost = cnn_lstm.negativeLogLikelihood(y, m)
+# theano.printing.pydotprint(cost, outfile="cost.png", var_with_name_simple
+# =True)
+# sys.exit(0)
 
     validate_model = theano.function(
-        inputs=[index, y],
-        outputs=cnn_lstm.bad30(y),
+        inputs=[index, y, m],
+        outputs=cnn_lstm.bad30(y, m),
         givens={
             xl: batchL[index],
             xr: batchR[index]
         }
     )
 
-    print('...model built')
     disp = [x.astype('int32') for x in disp]
-    val_loss = 0
-    for i in range(200):
-        valSample = RowSample[i][50:100]
-        disp_I = disp[i][50:100]
-        print(i)
-        L, R = generateData(ImageL, ImageR, i, valSample)
-        batchL.set_value(L, borrow=True)
-        batchR.set_value(R, borrow=True)
-        print('sent new data to gpu')
-        val_loss_perI = [validate_model(j, disp_I[j])
-                         for j in range(50)]
-        val_loss += sum(val_loss_perI)
-
-    print(val_loss / 10000.0)
-
     learning_rate = 0.003
-
+    validate_frequency = 5000
+    n_epochs = 200
+    # params = cnn_lstm.conv1.params + cnn_lstm.conv2.params
+    # params = params + cnn_lstm.conv3.params + cnn_lstm.conv4.params
+    # params = params + cnn_lstm.forward_lstm.params
+    # params = params + cnn_lstm.backward_lstm.params
     params = cnn_lstm.params
     g_params = T.grad(cost, params)
     updates = [(parami, parami - learning_rate * gradi)
                for parami, gradi in zip(params, g_params)]
 
     train_model = theano.function(
-        inputs=[index, y],
+        inputs=[index, y, m],
         outputs=cost,
         updates=updates,
         givens={
@@ -428,4 +429,66 @@ if __name__ == '__main__':
             xr: trainR[index]
         }
     )
-    
+    print('...model built')
+    ISOTIMEFORMAT = '%Y-%m-%d %H:%M:%S'
+    print('...training')
+    epoch = 0
+    done_looping = False
+    save_interval = 2
+    iter = 0
+    while (epoch < n_epochs) and (not done_looping):
+        epoch = epoch + 1
+        for image_index in range(200):
+            # iter = (epoch - 1) * 200 + image_index
+            trainSample = RowSample[image_index][0:200]
+            L, R = generateData(ImageL, ImageR, image_index, trainSample)
+            trainL.set_value(L, borrow=True)
+            trainR.set_value(R, borrow=True)
+            # for each row
+            disp_I = disp[image_index][0:200]
+            mask_I = mask[image_index]
+            mask_I = mask_I.astype(np.float32)
+
+            for sample_index in range(200):
+                cost_ij = train_model(sample_index, disp_I[sample_index],
+                                      mask_I)
+                # skip rows without groundtruth
+                if (disp_I[sample_index].sum() == 0):
+                    # print('skip')
+                    continue
+                if iter % 500 == 0:
+                    # print('image %i' % image_index)
+                    # print(disp_I[sample_index].sum())
+                    print(time.strftime(ISOTIMEFORMAT, time.localtime()))
+                    print('training iter = %i, error = %f' % (iter, cost_ij))
+
+                if (iter + 1) % validate_frequency == 0:
+                    val_loss = 0
+                    for i in range(200):
+                        valSample = RowSample[i][200:300]
+                        disp_I = disp[i][200:300]
+                        mask_I = mask[i]
+                        mask_I = mask_I.astype(np.float32)
+                        L, R = generateData(ImageL, ImageR, i, valSample)
+                        batchL.set_value(L, borrow=True)
+                        batchR.set_value(R, borrow=True)
+                        val_loss_perI = [
+                            validate_model(j, disp_I[j], mask_I)
+                            for j in range(100)]
+                        val_loss += sum(val_loss_perI)
+                    print('epoch %i, image %i/%i, validation_error %f %%' %
+                          (epoch, i, 200, val_loss / 20000))
+                iter += 1
+
+        if epoch % save_interval == 0:
+            pickle.dump([cnn_lstm.conv1.W, cnn_lstm.conv1.b,
+                         cnn_lstm.conv2.W, cnn_lstm.conv2.b,
+                         cnn_lstm.conv3.W, cnn_lstm.conv3.b,
+                         cnn_lstm.conv4.W, cnn_lstm.conv4.b,
+                         cnn_lstm.forward_lstm.W,
+                         cnn_lstm.forward_lstm.U,
+                         cnn_lstm.forward_lstm.b,
+                         cnn_lstm.backward_lstm.W,
+                         cnn_lstm.backward_lstm.U,
+                         cnn_lstm.backward_lstm.b],
+                        open('trained_%i' % epoch, 'wb'))
