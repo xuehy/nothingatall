@@ -1,6 +1,5 @@
 import theano
 import theano.tensor as T
-from theano.gradient import grad_clip
 import numpy as np
 import six.moves.cPickle as pickle
 import sys
@@ -48,15 +47,20 @@ class ConvReLULayer(object):
         self.params = [self.W, self.b]
 
     def makeLayer(self, inputL, inputR, ReLU):
-        """
-        inputX : (batch_size x number of patches) x
-        num of feature maps x patch width x patch height
-        conv_results : (bs x num of patches) x num of features x width x height
+        # input : batch_size x number of patches x
+        # num of feature maps x patch width x height
+        # conv_result: 1 x number of features x width x height
+        # conv_results : num of patches x num of features x width x height
 
-        """
+        # conv_results, updates = theano.scan(
+        #     fn=self._step,
+        #     sequences=[input]
+        # )
+        batch_size = self.patch_shape[0]
+        
 
         conv_results = T.nnet.conv2d(
-            # inputL, inputR: (batch_size x n_patch) x n_fea x w x h
+            # inputL, inputR: batch_size x n_patch x n_fea x w x h
             input=T.concatenate([inputL, inputR]),
             filters=self.W,
             input_shape=(1234 * 2 * self.patch_shape[0],
@@ -69,9 +73,8 @@ class ConvReLULayer(object):
             conv_results = T.nnet.relu(
                 conv_results
             )
-        batch_size = self.patch_shape[0]
-        left = conv_results[0: 1234 * batch_size]
-        right = conv_results[1234 * batch_size: 2468 * batch_size]
+        left = conv_results[0:1234 * batch_size]
+        right = conv_results[1234 * batch_size:2468*batch_size]
         return left, right
 
 
@@ -85,6 +88,7 @@ class lstm_layer(object):
     def __init__(self, hidden_dim):
         """
         :type state_below: tensor of [nsteps, batch_size, hidden_dim]
+        :param state_below: every row is the input of a time
 
         :type W: tensor of [4, hidden_dim, hidden_dim]
         :param W: [W_i, W_f, W_o, W_c]
@@ -110,13 +114,13 @@ class lstm_layer(object):
         W = theano.shared(
             value=W_values,
             borrow=True,
-            name='lstm_W'
+            name='W'
         )
 
         U = theano.shared(
             value=U_values,
             borrow=True,
-            name='lstm_U'
+            name='U'
         )
 
         b = theano.shared(
@@ -124,16 +128,12 @@ class lstm_layer(object):
                 b_value,
                 dtype=theano.config.floatX
             ),
-            name='lstm_b',
+            name='b',
             borrow=True
         )
         self.W = W
         self.U = U
         self.b = b
-        # for gradient clipping
-        self.W_ = grad_clip(W, -10, 10)
-        self.U_ = grad_clip(U, -10, 10)
-
         self.hidden_dim = hidden_dim
         self.params = [self.W, self.U, self.b]
 
@@ -149,7 +149,7 @@ class lstm_layer(object):
         """
         h_: hidden_dim row vector
         """
-        preact = T.dot(h_, self.U_)
+        preact = T.dot(h_, self.U)
         preact += x_
 
         i = T.nnet.sigmoid(self._slice(preact, 0, self.hidden_dim))
@@ -166,7 +166,7 @@ class lstm_layer(object):
         # this is W*x_t for t = 0, 1, 2, ...
         # and arranged in rows
         nsteps = state_below.shape[0]
-        state_below = (T.dot(state_below, self.W_) + self.b)
+        state_below = (T.dot(state_below, self.W) + self.b)
 
         def np_floatX(data):
             return np.asarray(data, dtype=theano.config.floatX)
@@ -283,20 +283,16 @@ class bi_lstm_cnn(object):
         self.params = self.params + self.backward_lstm.params
 
         # left: nSteps x batch size x dim
-        left_1 = self.forward_lstm.makeLayer(forward_lstm_input_left,
-                                             batch_size)
-        left_2 = self.backward_lstm.makeLayer(backward_lstm_input_left,
-                                              batch_size)
+        left_1 = self.forward_lstm.makeLayer(forward_lstm_input_left, batch_size)
+        left_2 = self.backward_lstm.makeLayer(backward_lstm_input_left, batch_size)
 
         left_feature = T.concatenate([left_1,
                                       left_2[::-1]],
                                      axis=2)
         # -< batch_size x nSteps x dim
         left_feature = left_feature.swapaxes(0, 1)
-        right_1 = self.forward_lstm.makeLayer(forward_lstm_input_right,
-                                              batch_size)
-        right_2 = self.backward_lstm.makeLayer(backward_lstm_input_right,
-                                               batch_size)
+        right_1 = self.forward_lstm.makeLayer(forward_lstm_input_right, batch_size)
+        right_2 = self.backward_lstm.makeLayer(backward_lstm_input_right, batch_size)
         right_feature = T.concatenate([right_1,
                                        right_2[::-1]],
                                       axis=2)
@@ -309,9 +305,9 @@ class bi_lstm_cnn(object):
         product = T.reshape(product, (1234 * batch_size, 1234))
         softmax_result = T.nnet.nnet.softmax(product)
         self.batch_size = batch_size
-        # (batch size x nSteps) x nSteps
+        # batch size x nSteps x nSteps
         self.softmax_result = softmax_result
-        # match_pred: (batch_size x nSteps) x 1
+        # match_pred: batch_size x nSteps
         self.match_pred = T.argmax(self.softmax_result, axis=1)
 
     # y is directly disparity: batch size x nSteps
@@ -329,7 +325,7 @@ class bi_lstm_cnn(object):
         N = T.sum(mask)
         nll = T.log(self.softmax_result)[T.arange(self.batch_size * 1234),
                                          match_idx]
-        return -T.sum(nll * mask) / (N + 1)
+        return -T.sum(nll * mask) / (N + 0.00001)
 
     def bad30(self, y, m):
         match_idx = T.arange(y.shape[1]) - y
@@ -341,7 +337,7 @@ class bi_lstm_cnn(object):
         return T.sum(T.ge(abs(match_idx -
                               self.match_pred[0: self.batch_size *
                                               y.shape[1]]),
-                          3.0) * mask) / (N + 1)
+                          3.0) * mask) / (N + 0.00001)
 
 
 def makeShare(x):
@@ -451,15 +447,15 @@ if __name__ == '__main__':
     xr = T.tensor4('xr')
     y = T.imatrix('y')
     m = T.matrix('m')
-    batch_size = 16
-    val_batch_size = 16
+    batch_size = int(sys.argv[1])
+    val_batch_size = int(sys.argv[1])
 
     trainL = theano.shared(
-        np.asarray(np.empty((batch_size * (1242-2*4), 3, 9, 9)),
+        np.asarray(np.empty((batch_size * 1234, 3, 9, 9)),
                    dtype=theano.config.floatX))
 
     trainR = theano.shared(
-        np.asarray(np.empty((batch_size * (1242-2*4), 3, 9, 9)),
+        np.asarray(np.empty((batch_size * 1234, 3, 9, 9)),
                    dtype=theano.config.floatX))
 
     batchL = theano.shared(
@@ -497,34 +493,18 @@ if __name__ == '__main__':
     )
 
     disp = [x.astype('int32') for x in disp]
-    weight_decay = 0.00001
     learning_rate = 0.00001
     lr = T.scalar('lr')
-    validate_frequency = 2500
+    validate_frequency = 500
     n_epochs = 200
-    n_batches = 40000 // batch_size
-    n_val_batches = 10000 // val_batch_size
+    n_batches = 1000 // batch_size
+    n_val_batches = 200 // val_batch_size
     # params = cnn_lstm.conv1.params + cnn_lstm.conv2.params
     # params = params + cnn_lstm.conv3.params + cnn_lstm.conv4.params
     # params = params + cnn_lstm.forward_lstm.params
     # params = params + cnn_lstm.backward_lstm.params
     params = cnn_lstm.params
 
-    # weight decay term
-    W1 = cnn_lstm.conv1.params[0]
-    W2 = cnn_lstm.conv2.params[0]
-    W3 = cnn_lstm.conv3.params[0]
-    W4 = cnn_lstm.conv4.params[0]
-    W5 = cnn_lstm.forward_lstm.params[0]
-    U5 = cnn_lstm.forward_lstm.params[1]
-    W6 = cnn_lstm.backward_lstm.params[0]
-    U6 = cnn_lstm.backward_lstm.params[1]
-    weight_decay_ = 0.
-    weight_decay_ += (W1 ** 2).sum() + (W2 ** 2).sum()
-    weight_decay_ += (W3 ** 2).sum() + (W4 ** 2).sum() + (W5 ** 2).sum()
-    weight_decay_ += (W6 ** 2).sum() + (U5 ** 2).sum() + (U6 ** 2).sum()
-    weight_decay_ *= weight_decay
-    cost += weight_decay_
     # sgd optimizer
     g_params = T.grad(cost, params)
     # updates = [(parami, parami - learning_rate * gradi)
@@ -546,8 +526,7 @@ if __name__ == '__main__':
                                       xl, xr, m, y, cost)
     print('...model built')
     ISOTIMEFORMAT = '%Y-%m-%d %H:%M:%S'
-    print('...training with batch size %i, weight decay %f \
-    and gradient clipping' % (batch_size, weight_decay))
+    print('...training with batch size %i' % batch_size)
     epoch = 0
     done_looping = False
     save_interval = 2
@@ -565,14 +544,13 @@ if __name__ == '__main__':
             #                       mask_I)
             cost_ij = f_grad_shared(D, m)
             f_update(learning_rate)
-            if iter % 500 == 0:
+            if iter % 10 == 0:
                 # print('image %i' % image_index)
                 # print(disp_I[sample_index].sum())
                 print(time.strftime(ISOTIMEFORMAT, time.localtime()))
                 print('training iter = %i, loss = %f' % (iter, cost_ij))
 
-            if (iter + 1) % validate_frequency == 0:
-                print('validating...')
+            if iter % validate_frequency == 0:
                 val_loss = 0
                 valSample = RowSample[40000:50000]
                 for i in range(n_val_batches):
@@ -599,4 +577,4 @@ if __name__ == '__main__':
                          cnn_lstm.backward_lstm.W,
                          cnn_lstm.backward_lstm.U,
                          cnn_lstm.backward_lstm.b],
-                        open('trained_e%i' % epoch, 'wb'))
+                        open('trained_%i' % epoch, 'wb'))
