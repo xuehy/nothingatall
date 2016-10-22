@@ -5,6 +5,8 @@ import numpy as np
 import six.moves.cPickle as pickle
 import sys
 import time
+import socket
+import theano.misc.pkl_utils
 
 
 class ConvReLULayer(object):
@@ -327,8 +329,9 @@ class bi_lstm_cnn(object):
         # in GT:
         # 0 indicates invalid pixel
         N = T.sum(mask)
-        nll = T.log(self.softmax_result)[T.arange(self.batch_size * 1234),
-                                         match_idx]
+        nll = T.log(self.softmax_result + 1e-10)[
+            T.arange(self.batch_size * 1234),
+            match_idx]
         return -T.sum(nll * mask) / (N + 1)
 
     def bad30(self, y, m):
@@ -342,6 +345,28 @@ class bi_lstm_cnn(object):
                               self.match_pred[0: self.batch_size *
                                               y.shape[1]]),
                           3.0) * mask) / (N + 1)
+
+    def load_model(self, snapshot):
+        load_file = open(snapshot, 'rb')
+        for p in self.params:
+            p.set_value(pickle.load(load_file), borrow=True)
+        print('loaded snapshot from ' + snapshot)
+        # self.conv1.W,
+        # self.conv1.b,
+        # self.conv2.W,
+        # self.conv2.b,
+        # self.conv3.W,
+        # self.conv3.b,
+        # self.conv4.W,
+        # self.conv4.b,
+        # self.forward_lstm.W,
+        # self.forward_lstm.U,
+        # self.forward_lstm.b,
+        # self.backward_lstm.W,
+        # self.backward_lstm.U,
+        # self.backward_lstm.b = theano.misc.pkl_utils.load(
+        #     open(snapshot, 'rb')
+        # )
 
 
 def makeShare(x):
@@ -446,7 +471,48 @@ def rmsprop(lr, params, grads, trainL, trainR,
                                name='rmsprop_f_update')
     return f_grad_shared, f_update
 
+
+# adadelta
+def adadelta(lr, params, grads, trainL, trainR,
+             xl, xr, m, y, cost):
+    zipped_grads = [theano.shared(p.get_value() * numpy_floatX(0.))
+                    for p in params]
+    running_up2 = [theano.shared(p.get_value() * numpy_floatX(0.))
+                   for p in params]
+    running_grads2 = [theano.shared(p.get_value() * numpy_floatX(0.))
+                      for p in params]
+    zgup = [(zg, g) for zg, g in zip(zipped_grads, grads)]
+    rg2up = [(rg2, 0.95 * rg2 + 0.05 * (g ** 2))
+             for rg2, g in zip(running_grads2, grads)]
+    f_grad_shared = theano.function([y, m], cost,
+                                    updates=zgup + rg2up,
+                                    givens={
+                                        xl: trainL,
+                                        xr: trainR
+                                    },
+                                    name='adadelta_f_grad_shared')
+    updir = [-T.sqrt(ru2 + 1e-6) / T.sqrt(rg2 + 1e-6) * zg
+             for zg, ru2, rg2 in zip(zipped_grads,
+                                     running_up2,
+                                     running_grads2)]
+    ru2up = [(ru2, 0.95 * ru2 + 0.05 * (ud ** 2))
+             for ru2, ud in zip(running_up2, updir)]
+
+    param_up = [(p, p + ud) for p, ud in zip(params, updir)]
+    f_update = theano.function([lr], [],
+                               updates=ru2up + param_up,
+                               givens={
+                                   xl: trainL,
+                                   xr: trainR
+                               },
+                               on_unused_input='ignore',
+                               name='adadelta_f_update')
+    return f_grad_shared, f_update
+
+
 if __name__ == '__main__':
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    address = ('10.76.1.30', 5274)
     xl = T.tensor4('xl')
     xr = T.tensor4('xr')
     y = T.imatrix('y')
@@ -546,8 +612,12 @@ if __name__ == '__main__':
                                       xl, xr, m, y, cost)
     print('...model built')
     ISOTIMEFORMAT = '%Y-%m-%d %H:%M:%S'
-    print('...training with batch size %i, weight decay %f \
-    and gradient clipping' % (batch_size, weight_decay))
+    print('...training with batch size %i, weight decay %f'
+          % (batch_size, weight_decay))
+    print('total number of batches %i' % n_batches)
+    print('All Conv Layer are with ReLU')
+    print('With gradient clipping')
+    print('lr policy: RMSProp')
     epoch = 0
     done_looping = False
     save_interval = 2
@@ -570,6 +640,8 @@ if __name__ == '__main__':
                 # print(disp_I[sample_index].sum())
                 print(time.strftime(ISOTIMEFORMAT, time.localtime()))
                 print('training iter = %i, loss = %f' % (iter, cost_ij))
+                msg = "Iter = %d, Loss = %f" % (iter, cost_ij)
+                s.sendto(msg.encode(), address)
 
             if (iter + 1) % validate_frequency == 0:
                 print('validating...')
@@ -589,14 +661,21 @@ if __name__ == '__main__':
                       (epoch, val_loss / n_val_batches * 100))
 
         if epoch % save_interval == 0:
-            pickle.dump([cnn_lstm.conv1.W, cnn_lstm.conv1.b,
-                         cnn_lstm.conv2.W, cnn_lstm.conv2.b,
-                         cnn_lstm.conv3.W, cnn_lstm.conv3.b,
-                         cnn_lstm.conv4.W, cnn_lstm.conv4.b,
-                         cnn_lstm.forward_lstm.W,
-                         cnn_lstm.forward_lstm.U,
-                         cnn_lstm.forward_lstm.b,
-                         cnn_lstm.backward_lstm.W,
-                         cnn_lstm.backward_lstm.U,
-                         cnn_lstm.backward_lstm.b],
-                        open('trained_e%i' % epoch, 'wb'))
+            print('...saving snapshot into trained_epoch%i' % epoch)
+            save_file = open('trained_epoch%i' % epoch, 'wb')
+            for p in cnn_lstm.params:
+                pickle.dump(p.get_value(borrow=True), save_file)
+
+            # theano.misc.pkl_utils.dump((cnn_lstm.conv1.W, cnn_lstm.conv1.b,
+            #                             cnn_lstm.conv2.W, cnn_lstm.conv2.b,
+            #                             cnn_lstm.conv3.W, cnn_lstm.conv3.b,
+            #                             cnn_lstm.conv4.W, cnn_lstm.conv4.b,
+            #                             cnn_lstm.forward_lstm.W,
+            #                             cnn_lstm.forward_lstm.U,
+            #                             cnn_lstm.forward_lstm.b,
+            #                             cnn_lstm.backward_lstm.W,
+            #                             cnn_lstm.backward_lstm.U,
+            #                             cnn_lstm.backward_lstm.b),
+            #                            open('trained_e%i.zip' % epoch, 'wb'))
+
+    s.close()
