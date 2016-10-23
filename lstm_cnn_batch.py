@@ -351,6 +351,7 @@ class bi_lstm_cnn(object):
         for p in self.params:
             p.set_value(pickle.load(load_file), borrow=True)
         print('loaded snapshot from ' + snapshot)
+        load_file.close()
         # self.conv1.W,
         # self.conv1.b,
         # self.conv2.W,
@@ -665,7 +666,7 @@ if __name__ == '__main__':
             save_file = open('trained_epoch%i' % epoch, 'wb')
             for p in cnn_lstm.params:
                 pickle.dump(p.get_value(borrow=True), save_file)
-
+            save_file.close()
             # theano.misc.pkl_utils.dump((cnn_lstm.conv1.W, cnn_lstm.conv1.b,
             #                             cnn_lstm.conv2.W, cnn_lstm.conv2.b,
             #                             cnn_lstm.conv3.W, cnn_lstm.conv3.b,
