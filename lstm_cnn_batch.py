@@ -7,6 +7,7 @@ import sys
 import time
 import socket
 import theano.misc.pkl_utils
+import random
 
 
 class ConvReLULayer(object):
@@ -623,12 +624,14 @@ if __name__ == '__main__':
     done_looping = False
     save_interval = 2
     iter = 0
+    TRAIN_SAMPLE = RowSample[0:40000]
+    VAL_SAMPLE = RowSample[40000:50000]
     while (epoch < n_epochs) and (not done_looping):
         epoch = epoch + 1
         for batch_id in range(n_batches):
             iter = (epoch - 1) * n_batches + batch_id
             L, R, D, m = generateData(ImageL, ImageR, disp, mask,
-                                      RowSample[0:40000], batch_id, batch_size)
+                                      TRAIN_SAMPLE, batch_id, batch_size)
             trainL.set_value(L, borrow=True)
             trainR.set_value(R, borrow=True)
             # for each row
@@ -647,7 +650,7 @@ if __name__ == '__main__':
             if (iter + 1) % validate_frequency == 0:
                 print('validating...')
                 val_loss = 0
-                valSample = RowSample[40000:50000]
+                valSample = VAL_SAMPLE
                 for i in range(n_val_batches):
                     L_val, R_val, D_val, m_val = generateData(ImageL,
                                                               ImageR,
@@ -660,7 +663,8 @@ if __name__ == '__main__':
                     val_loss += validate_model(D_val, m_val)
                 print('epoch %i, validation_error %f %%' %
                       (epoch, val_loss / n_val_batches * 100))
-
+        print('...random shuffling data')
+        random.shuffle(TRAIN_SAMPLE)
         if epoch % save_interval == 0:
             print('...saving snapshot into trained_epoch%i' % epoch)
             save_file = open('trained_epoch%i' % epoch, 'wb')
